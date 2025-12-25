@@ -12,6 +12,8 @@ Examples:
 
 ![Haskell Code Explorer](https://haskell-code-explorer.mfix.io/screenshot.png)
 
+- for 9.10.2 [http://www.haskell.fan](http://www.haskell.fun)
+
 The public instance of Haskell Code Explorer is available at [https://haskell-code-explorer.mfix.io](https://haskell-code-explorer.mfix.io). It contains core libraries (ghc, base, etc.) and a subset of packages from a Stackage snapshot.
 
 Haskell Code Explorer consists of an indexer, an HTTP server, and a JavaScript application. The indexer uses GHC API to create a data structure that contains detailed information about the source code of a Cabal package. The HTTP server reads that data structure into memory and responds to HTTP requests from the JavaScript application.
@@ -39,57 +41,31 @@ Reading and understanding code is an essential part of the software development 
 
 * Semantic highlighting
 
-## Installation
+## Installing
+At the moment Haskell Code Explorer supports GHC 9.10.2
 
 ```bash
 git clone https://github.com/alexwl/haskell-code-explorer
 cd haskell-code-explorer
 ```
-
-To build Haskell Code Explorer Stack ([https://docs.haskellstack.org/en/stable/README/](https://docs.haskellstack.org/en/stable/README/)) is needed.
-
-At the moment Haskell Code Explorer supports GHC 8.6.5, 8.6.4, GHC 8.6.3, GHC 8.4.4, GHC 8.4.3, GHC 8.2.2, and 8.0.2.
-
-For GHC 8.6.5:
+For GHC 9.10.2:
 
 ```bash
 stack install
 ```
 
-For GHC 8.6.4:
+For GHC 9.10.2:
 
 ```bash
-stack --stack-yaml=stack-8.6.4.yaml install
+stack --stack-yaml=stack-9.10.2.yaml install
 ```
 
-For GHC 8.6.3:
-
+## Debugging
+Modify `haskell-code-explorer` and `vendor/ghc/compiler`.
+Modify `index` script
 ```bash
-stack --stack-yaml=stack-8.6.3.yaml install
-```
-
-For GHC 8.4.4:
-
-```bash
-stack --stack-yaml=stack-8.4.4.yaml install
-```
-
-For GHC 8.4.3:
-
-```bash
-stack --stack-yaml=stack-8.4.3.yaml install
-```
-
-For GHC 8.2.2:
-
-```bash
-stack --stack-yaml=stack-8.2.2.yaml install
-```
-
-For GHC 8.0.2:
-
-```bash
-stack --stack-yaml=stack-8.0.2.yaml install
+sudo chmod 777 index
+./index
 ```
 
 ## Indexing source code of a Cabal package
@@ -100,18 +76,35 @@ A package should be built using either cabal-install or stack before indexing (`
 
 The version of GHC used to build `haskell-code-indexer` must match the version of GHC used to build a package you are indexing (to find out the version of GHC try `ghc --version` or `stack exec ghc -- --version` command).
 
-`haskell-code-indexer` requires globally installed GHC and cabal-install (`cabal`). The reason for this is that `haskell-code-indexer` uses `cabal-helper` library [https://hackage.haskell.org/package/cabal-helper](https://hackage.haskell.org/package/cabal-helper) to get package build information. `cabal-helper` builds (at runtime) an executable linked against a version of Cabal library that was used to configure the package. You may need to run `cabal update` to get the latest list of available packages to be able to build the `cabal-helper` executable. By default, the `cabal-helper` executable (e.g.,`cabal-helper0.8.1.2-Cabal2.4.1.0`) is saved to `$HOME/.cache/cabal-helper`.
+`haskell-code-indexer` requires globally installed GHC and cabal-install (`cabal`). The reason for this is that `haskell-code-indexer` uses `cabal` library to get package build information.
 
 If there is no globally installed GHC on the system, then it is possible to use `stack exec` command ([https://docs.haskellstack.org/en/stable/GUIDE/#exec](https://docs.haskellstack.org/en/stable/GUIDE/#exec)) that adds a path to GHC binaries installed by Stack to `PATH` environment variable.
 
+Unify snapshot of stackage. For ghc 9.10.2, using lts-24.11
+```
+resolver: lts-24.11
+```
+
+Build All targets
+```
+stack ide targets
+stack build --test --bench
+```
+
 Run `cabal update` using stack exec:
 ```bash
-stack --resolver=lts-13.20 exec --no-ghc-package-path cabal -- update
+stack --resolver=lts-24.11 exec --no-ghc-package-path cabal -- update
 ```
 
 Index a package using stack exec:
 ```bash
-stack --resolver=lts-13.20 exec --no-ghc-package-path haskell-code-indexer -- INDEXER_OPTIONS
+stack --resolver=lts-24.11 exec --no-ghc-package-path haskell-code-indexer -- INDEXER_OPTIONS
+```
+
+Or modify and execute `index` script
+```bash
+sudo chmod 777 index
+./index
 ```
 
 `--no-ghc-package-path` option unsets `GHC_PACKAGE_PATH` environment variable. `cabal` fails with the error `Use of GHC's environment variable GHC_PACKAGE_PATH is incompatible with Cabal.` if the `GHC_PACKAGE_PATH` is set.
@@ -155,6 +148,12 @@ Load multiple indexed packages and start the server:
 
 ```bash
 haskell-code-server --package PATH1 --package PATH2 --package PATH3 --port 8080
+```
+
+Or modify or execute `server` script
+```bash
+sudo chmod 777 server
+./server
 ```
 
 Load the indexed package and start the server, use Hoogle API (https://github.com/ndmitchell/hoogle/blob/3dbf68bfd701f942d3af2e6debb74a0a78cd392e/docs/API.md#json-api) to get documentation for functions and types defined in other packages (`haskell-code-server` makes requests to https://hoogle.haskell.org/):

@@ -1,6 +1,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 
 module HaskellCodeExplorer.Preprocessor
   ( createSourceCodeTransformation
@@ -12,6 +13,7 @@ import Data.Foldable (foldl')
 import qualified Data.HashMap.Strict as HM
 import qualified Data.List as L
 import qualified Data.Set as S
+import Prelude
 import qualified Data.Text as T
 import HaskellCodeExplorer.Types
   ( FileLocation(..)
@@ -46,7 +48,6 @@ createSourceCodeTransformation currentModulePath originalSourceCode sourceCodeAf
           Left _ -> acc
       totalLines = length numberedLines
       pragmas = L.reverse . L.foldl' addPragma [] $ numberedLines
-      pragmaPath = filePath :: LinePragma -> HaskellFilePath
       currentFileExtension =
         takeExtension . T.unpack . getHaskellFilePath $ currentFilePath
       standardHeaderFiles =
@@ -66,7 +67,7 @@ createSourceCodeTransformation currentModulePath originalSourceCode sourceCodeAf
                   (path /= HaskellFilePath "<command-line>") &&
                   not ("ghc_" `L.isPrefixOf` fileName) &&
                   (fileName `notElem` standardHeaderFiles)) .
-           pragmaPath)
+           (\lineParam -> lineParam.filePath))
           pragmas
    in if hasIncludedFiles ||
          currentFileExtension `elem` haskellPreprocessorExtensions
