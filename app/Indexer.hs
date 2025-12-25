@@ -106,7 +106,7 @@ main = do
            (configPackageDirectoryPath config)
            (configPackageDistDirRelativePath config)
            (configSourceCodePreprocessing config)
-           ((configGhcOptions config) <> [T.unpack "-DHASKELL_CODE_INDEXER"])
+           ((configGhcOptions config) <> ["-DHASKELL_CODE_INDEXER"])
            (configIgnoreDirectories config))
         (\_loc _source level msg -> logger loggerSet minLogLevel level msg)
     let outputDir =
