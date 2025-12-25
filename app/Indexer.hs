@@ -19,7 +19,7 @@ import qualified Data.Serialize as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time (getZonedTime)
-import Data.Version (showVersion)
+import Data.Version (showVersion, Version(..))
 import HaskellCodeExplorer.PackageInfo (createPackageInfo, ghcVersion)
 import qualified HaskellCodeExplorer.Types as HCE
 import Network.URI.Encode (encode)
@@ -43,6 +43,7 @@ import Options.Applicative
   , value
   )
 import Paths_haskell_code_explorer as HSE (version)
+import Prelude
 import System.Directory (createDirectoryIfMissing)
 import System.Exit (ExitCode(..), exitWith)
 import System.FilePath ((</>))
@@ -105,7 +106,7 @@ main = do
            (configPackageDirectoryPath config)
            (configPackageDistDirRelativePath config)
            (configSourceCodePreprocessing config)
-           (configGhcOptions config)
+           ((configGhcOptions config) <> ["-DHASKELL_CODE_INDEXER"])
            (configIgnoreDirectories config))
         (\_loc _source level msg -> logger loggerSet minLogLevel level msg)
     let outputDir =

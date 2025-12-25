@@ -6,6 +6,7 @@
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module HaskellCodeExplorer.PackageInfo
@@ -42,33 +43,43 @@ import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Version (Version(..), showVersion, makeVersion)
-import Digraph (flattenSCCs)
-import Distribution.Helper
-  ( ChComponentName(..)
-  , ChEntrypoint(..)
-  , ChModuleName(..)
-  , components
-  , entrypoints
-  , ghcOptions
-  , mkQueryEnv
-  , packageId
-  , runQuery
-  , sourceDirs
-  , compilerVersion
-  )
-import DynFlags
+import GHC.Driver.Phases (Phase)
+import System.Directory (canonicalizePath)
+import Data.Bool
+import GHC.Utils.Logger
+  ( getLogger
+  , LogFlags(..)
+  , pushLogHook )
+import GHC.Utils.Error
+  ( Severity
+  , MessageClass(..) )
+import GHC.Types.SrcLoc   (SrcSpan)
+import GHC.Utils.Outputable (SDoc, showSDocUnsafe)
+import GHC.Unit.Module.Graph
+  ( ModuleGraphNode(..)
+  , mgModSummaries' )
+import Data.Maybe (mapMaybe)
+import GHC.Unit.Types (UnitId)
+import GHC.Data.Graph.Directed (flattenSCCs)
+import qualified GHC.Utils.Exception as GHCEx
+import GHC.Driver.Session
   ( DynFlags(..)
   , GeneralFlag(..)
   , GhcMode(..)
-  , WarnReason(..)
   , gopt_set
   , parseDynamicFlagsCmdLine
+  , ModRenaming(..)
+  , PackageArg(..)
+  , PackageFlag(..)
+  , WarningFlag(..)
+  , wopt_unset
   )
-import Exception (ExceptionMonad(..), ghandle)
+import GHC.Utils.Exception (ExceptionMonad(..), handle)
+import GHC.Driver.Backend (Backend(..))
 import GHC
   ( GhcLink(..)
-  , HscTarget(..)
   , LoadHowMuch(..)
+  , Phase(..)
   , ModLocation(..)
   , ModSummary(..)
   , Severity
@@ -89,13 +100,24 @@ import GHC
   , moduleName
   )
 import GHC.Paths (libdir)
-import GhcMonad (GhcT(..), liftIO)
+import GHC.Driver.Monad
+  ( GhcT(..)
+  , liftIO
+  , setSession )
 import HaskellCodeExplorer.GhcUtils (isHsBoot,toText)
 import HaskellCodeExplorer.ModuleInfo (ModuleDependencies, createModuleInfo)
 import qualified HaskellCodeExplorer.Types as HCE
-import HscTypes (hsc_EPS, hsc_HPT)
-import Outputable (PprStyle, SDoc, neverQualify, showSDocForUser)
-import Packages (initPackages)
+import GHC.Driver.Env
+  ( hscEPS
+  , hsc_HPT
+  , hsc_logger)
+import GHC.Utils.Outputable
+  ( PprStyle
+  , SDoc
+  , neverQualify
+  , showSDocUnsafe
+  , ppr)
+import GHC.Unit.State (initUnits)
 import Prelude hiding (id)
 import System.Directory
   ( doesFileExist
@@ -110,7 +132,9 @@ import System.Exit (exitFailure)
 import System.FilePath
   ( (</>)
   , addTrailingPathSeparator
+  , isAbsolute
   , joinPath
+  , makeRelative
   , normalise
   , replaceExtension
   , splitPath
@@ -122,192 +146,279 @@ import System.FilePath
   )
 import System.FilePath.Find (find,always,(==?),fileName)
 import System.Process (readProcess)
+import qualified Data.Set as Set
+import Distribution.PackageDescription
+import Distribution.PackageDescription.Configuration (flattenPackageDescription)
+import Distribution.PackageDescription.Parsec (parseGenericPackageDescription, runParseResult)
+import qualified Data.ByteString as BS
+import Distribution.Verbosity (normal)
+import Distribution.ModuleName (toFilePath)
+import Distribution.Simple.Compiler (CompilerFlavor(..))
+import Distribution.Pretty (prettyShow)
+import Distribution.Utils.Path (getSymbolicPath)
+import Distribution.PackageDescription (package)
+import Distribution.Types.PackageId (pkgName, pkgVersion)
+import Distribution.Pretty (prettyShow)
+import Control.Monad.Catch (MonadCatch, MonadThrow, MonadMask, catch, throwM, mask)
+import qualified Data.Version as BaseV
+import qualified Distribution.Types.Version as CabalV
 
 createPackageInfo ::
-     FilePath -- ^ Path to a Cabal package
-  -> Maybe FilePath -- ^ Relative path to a dist directory
-  -> HCE.SourceCodePreprocessing -- ^ Before or after preprocessor
-  -> [String] -- ^ Options for GHC
-  -> [String] -- ^ Directories to ignore
+     FilePath
+  -> Maybe FilePath
+  -> HCE.SourceCodePreprocessing
+  -> [String]
+  -> [String]
   -> LoggingT IO (HCE.PackageInfo HCE.ModuleInfo)
 createPackageInfo packageDirectoryPath mbDistDirRelativePath sourceCodePreprocessing additionalGhcOptions ignoreDirectories = do
-  packageDirectoryAbsPath <- liftIO $ makeAbsolute packageDirectoryPath
+  packageDirectoryAbsPath <- liftIO $ canonicalizePath =<< (makeAbsolute packageDirectoryPath)
   currentDirectory <- liftIO getCurrentDirectory
   liftIO $ setCurrentDirectory packageDirectoryAbsPath
+
   distDir <-
     case mbDistDirRelativePath of
-      Just path -> return $ packageDirectoryAbsPath </> path
+      Just path -> pure (packageDirectoryAbsPath </> path)
       Nothing -> do
         eitherDistDir <- findDistDirectory packageDirectoryAbsPath
         case eitherDistDir of
-          Right distDir -> return distDir
-          Left errorMessage ->
-            logErrorN (T.pack errorMessage) >> liftIO exitFailure
+          Right d -> pure d
+          Left err -> logErrorN (T.pack err) >> liftIO exitFailure
+
   cabalFiles <-
     liftIO $
-    length .
-    filter
-      (\path -> takeFileName path /= ".cabal" && takeExtension path == ".cabal") <$>
-    getDirectoryContents packageDirectoryAbsPath
+      length .
+      filter (\p -> takeFileName p /= ".cabal" && takeExtension p == ".cabal")
+      <$> getDirectoryContents packageDirectoryAbsPath
   _ <-
     if cabalFiles == 0
-      then do
-        logErrorN $
-          T.concat ["No .cabal file found in ", T.pack packageDirectoryAbsPath]
-        liftIO exitFailure
+      then logErrorN (T.concat ["No .cabal file found in ", T.pack packageDirectoryAbsPath]) >> liftIO exitFailure
       else when (cabalFiles >= 2) $ do
-             logErrorN $
-               T.concat
-                 [ "Found more than one .cabal file in "
-                 , T.pack packageDirectoryAbsPath
-                 ]
+             logErrorN (T.concat ["Found more than one .cabal file in ", T.pack packageDirectoryAbsPath])
              liftIO exitFailure
-  let cabalHelperQueryEnv = mkQueryEnv packageDirectoryAbsPath distDir
-  ((packageName, packageVersion), (_packageCompilerName, packageCompilerVersion), compInfo) <-
-    liftIO $
-    runQuery
-      cabalHelperQueryEnv
-      ((,,) <$> packageId <*> compilerVersion <*>
-       (zip3 <$> components ((,) <$> ghcOptions) <*>
-        components ((,) <$> entrypoints) <*>
-        components ((,) <$> sourceDirs)))
-  let currentPackageId = HCE.PackageId (T.pack packageName) packageVersion
-  unless
-    (take 3 (versionBranch packageCompilerVersion) ==
-     take 3 (versionBranch ghcVersion)) $ do
-    logErrorN $
-      T.concat
-        [ "GHC version mismatch. haskell-code-indexer: "
-        , T.pack $ showVersion ghcVersion
-        , ", package: "
-        , T.pack $ showVersion packageCompilerVersion
-        ]
-    liftIO exitFailure
+
+  cabalFile <- liftIO $ findSingleCabalFile packageDirectoryAbsPath
+  bs <- liftIO $ BS.readFile cabalFile
+  let (_warnings, res) = runParseResult (parseGenericPackageDescription bs)
+  gpd <- case res of
+    Right g -> pure g
+    Left err -> do
+      logErrorN (T.pack ("Failed to parse cabal file: " <> show err))
+      liftIO exitFailure
+  let pd   = flattenPackageDescription gpd
+      pkgId = package pd
+      currentPackageId =
+        HCE.PackageId
+          (T.pack (prettyShow (pkgName pkgId)))
+          (makeVersion (CabalV.versionNumbers (pkgVersion pkgId)))
   logInfoN $ T.append "Indexing " $ HCE.packageIdToText currentPackageId
-  let buildComponents =
-        L.map
-          (\((options, compName), (entrypoint, _), (srcDirs, _)) ->
-             ( chComponentNameToComponentId compName
-             , options
-             , chEntrypointsToModules entrypoint
-             , srcDirs
-             , chComponentNameToComponentType compName)) .
-        L.sortBy
-          (\((_, compName1), _, _) ((_, compName2), _, _) ->
-             compare compName1 compName2) $
-        compInfo
+
+  let buildComponents :: [(HCE.ComponentId, [String], (Maybe FilePath, [String]), [FilePath], HCE.ComponentType)]
+      buildComponents = subLibs pd ++ libs pd ++ flibs pd ++ exes pd ++ tests pd ++ benches pd
+
+      subLibs Distribution.PackageDescription.PackageDescription{subLibraries = xs} =
+        [ mkLib ("sublib-" <> unUnqualComponentName uqn) l []
+        | l <- xs
+        , LSubLibName uqn <- [libName l]
+        ]
+      hiddenLibDirs :: [FilePath]
+      hiddenLibDirs = concat
+        [  map getSymbolicPath (hsSourceDirs (libBuildInfo l))
+        | l <- subLibraries pd ]
+
+      libs Distribution.PackageDescription.PackageDescription{library = Just lib} =
+        [ mkLib "lib" lib hiddenLibDirs ]
+      libs _ = []
+
+      flibs Distribution.PackageDescription.PackageDescription{foreignLibs = xs} =
+        [ mkFLib ("flib-" <> unUnqualComponentName (foreignLibName f)) f
+        | f <- xs ]
+
+      exes Distribution.PackageDescription.PackageDescription{executables = xs} =
+        [ mkExe ("exe-" <> unUnqualComponentName (exeName e)) e hiddenLibDirs
+        | e <- xs ]
+
+      tests Distribution.PackageDescription.PackageDescription{testSuites = xs} =
+        [ mkTest ("test-" <> unUnqualComponentName (testName t)) t hiddenLibDirs
+        | t <- xs ]
+
+      benches Distribution.PackageDescription.PackageDescription{benchmarks = xs} =
+        [ mkBench ("bench-" <> unUnqualComponentName (benchmarkName b)) b hiddenLibDirs
+        | b <- xs ]
+
+      -- helpers
+      mkLib :: String -> Library -> [FilePath] 
+               -> (HCE.ComponentId, [String], (Maybe FilePath, [String]), [FilePath], HCE.ComponentType)
+      mkLib cid lib hiddenLibDirs =
+        let bi        = libBuildInfo lib
+            srcDirs   = collectHsDirs distDir bi []
+            exposeds  = map Distribution.Pretty.prettyShow (exposedModules lib)
+            others    = map Distribution.Pretty.prettyShow (otherModules bi)
+            sigs      = map Distribution.Pretty.prettyShow (signatures lib)
+            mods      = exposeds ++ others ++ sigs
+        in ( HCE.ComponentId (T.pack cid)
+           , ghcOptionsForBI packageDirectoryAbsPath distDir bi hiddenLibDirs
+           , (Nothing, mods)
+           , srcDirs
+           , HCE.Lib
+           )
+
+      mkFLib cid fl =
+        let bi      = foreignLibBuildInfo fl
+            srcDirs = collectHsDirs distDir bi []
+        in ( HCE.ComponentId (T.pack cid)
+           , ghcOptionsForBI packageDirectoryAbsPath distDir bi []
+           , (Nothing, [])
+           , srcDirs
+           , HCE.FLib (T.pack (unUnqualComponentName (foreignLibName fl)))
+           )
+
+      mkExe cid e hiddenLibDirs =
+        let bi      = (buildInfo e)
+            srcDirs = collectHsDirs distDir bi []
+            mainFP  = modulePath e
+        in ( HCE.ComponentId (T.pack cid)
+           , ghcOptionsForBI packageDirectoryAbsPath distDir bi hiddenLibDirs
+           , (Just mainFP, [])
+           , srcDirs
+           , HCE.Exe (T.pack (unUnqualComponentName (exeName e)))
+           )
+
+      mkTest cid t hiddenLibDirs =
+        case testInterface t of
+          TestSuiteExeV10 _ mainFP ->
+            let bi      = testBuildInfo t
+                srcDirs = collectHsDirs distDir bi []
+            in ( HCE.ComponentId (T.pack cid)
+               , ghcOptionsForBI packageDirectoryAbsPath distDir bi hiddenLibDirs
+               , (Just mainFP, [])
+               , srcDirs
+               , HCE.Test (T.pack (unUnqualComponentName (testName t)))
+               )
+          _ ->
+            let bi = testBuildInfo t
+            in ( HCE.ComponentId (T.pack cid)
+               , ghcOptionsForBI packageDirectoryAbsPath distDir bi hiddenLibDirs
+               , (Nothing, [])
+               , collectHsDirs distDir bi []
+               , HCE.Test (T.pack (unUnqualComponentName (testName t)))
+               )
+
+      mkBench cid b hiddenLibDirs =
+        case benchmarkInterface b of
+          BenchmarkExeV10 _ mainFP ->
+            let bi      = benchmarkBuildInfo b
+                srcDirs = collectHsDirs distDir bi []
+            in ( HCE.ComponentId (T.pack cid)
+               , ghcOptionsForBI packageDirectoryAbsPath distDir bi hiddenLibDirs
+               , (Just mainFP, [])
+               , srcDirs
+               , HCE.Bench (T.pack (unUnqualComponentName (benchmarkName b)))
+               )
+          _ ->
+            let bi = benchmarkBuildInfo b
+            in ( HCE.ComponentId (T.pack cid)
+               , ghcOptionsForBI packageDirectoryAbsPath distDir bi hiddenLibDirs
+               , (Nothing, [])
+               , collectHsDirs distDir bi []
+               , HCE.Bench (T.pack (unUnqualComponentName (benchmarkName b)))
+               )
+
+      unUnqualComponentName = Distribution.Pretty.prettyShow
+
       libSrcDirs =
-        concatMap (\(_, _, _, srcDirs, _) -> srcDirs) .
-        filter (\(_, _, _, _, compType) -> HCE.isLibrary compType) $
-        buildComponents
+        concatMap (\(_,_,_,dirs,_) -> dirs)
+          $ filter (\(_,_,_,_,ct) -> HCE.isLibrary ct) buildComponents
+  
   (indexedModules, (_fileMapResult, _defSiteMapResult, modNameMapResult)) <-
     foldM
-      (\(modules, (fileMap, defSiteMap, modNameMap)) (compId, options, (mbMain, moduleNames), srcDirs, _) -> do
-         mbMainPath <-
-           case mbMain of
-             Just mainPath ->
-               liftIO $
-               findM doesFileExist $
-               mainPath :
-               map (\srcDir -> normalise $ srcDir </> mainPath) srcDirs
-             Nothing -> return Nothing
-         (modules', (fileMap', defSiteMap', modNameMap')) <-
-           indexBuildComponent
-             sourceCodePreprocessing
-             currentPackageId
-             compId
-             (fileMap, defSiteMap, modNameMap)
-             srcDirs
-             libSrcDirs
-             (options ++ additionalGhcOptions)
-             (maybe moduleNames (: moduleNames) mbMainPath)
-         return (modules ++ modules', (fileMap', defSiteMap', modNameMap')))
+      (\(modules, (fileMap, defSiteMap, modNameMap))
+         (compId, options, (mbMain, moduleNames), srcDirs, _compType) -> do
+           mbMainPath <-
+             case mbMain of
+               Just mainPath ->
+                 liftIO $
+                   findM doesFileExist
+                     (mainPath : map (\d -> normalise (d </> mainPath)) srcDirs)
+               Nothing -> pure Nothing
+           (modules', (fileMap', defSiteMap', modNameMap')) <-
+             indexBuildComponent
+               sourceCodePreprocessing
+               currentPackageId
+               compId
+               (fileMap, defSiteMap, modNameMap)
+               srcDirs
+               libSrcDirs
+               (options ++ additionalGhcOptions)
+               (maybe moduleNames (: moduleNames) mbMainPath)
+           pure (modules ++ modules', (fileMap', defSiteMap', modNameMap')))
       ([], (HM.empty, HM.empty, HM.empty))
       buildComponents
-  let modId = HCE.id :: HCE.ModuleInfo -> HCE.HaskellModulePath
-      moduleMap =
-        HM.fromList . map (\modInfo -> (modId modInfo, modInfo)) $
-        indexedModules
-      references = L.foldl' addReferencesFromModule HM.empty indexedModules
-      moduleId = HCE.id :: HCE.ModuleInfo -> HCE.HaskellModulePath
+
+  let moduleMap =
+        HM.fromList $ map (\m -> (m.id, m)) indexedModules
+      references =
+        L.foldl' addReferencesFromModule HM.empty indexedModules
       topLevelIdentifiersTrie =
-        L.foldl' addTopLevelIdentifiersFromModule HCE.emptyTrie .
-        L.filter (not . isHsBoot . moduleId) $
-        indexedModules
+        L.foldl' addTopLevelIdentifiersFromModule HCE.emptyTrie
+        $ L.filter (not . isHsBoot . (\m -> m.id)) indexedModules
+
   directoryTree <-
     liftIO $
-    buildDirectoryTree
-      packageDirectoryAbsPath
-      ignoreDirectories
-      (\path -> HM.member (HCE.HaskellModulePath . T.pack $ path) moduleMap)
+      buildDirectoryTree
+        packageDirectoryAbsPath
+        ignoreDirectories
+        (\p -> HM.member (HCE.HaskellModulePath . T.pack $ p) moduleMap)
+
   liftIO $ setCurrentDirectory currentDirectory
-  return
-    HCE.PackageInfo
-      { id = currentPackageId
-      , moduleMap = moduleMap
-      , moduleNameMap = modNameMapResult
-      , directoryTree = directoryTree
-      , externalIdOccMap = references
-      , externalIdInfoMap = topLevelIdentifiersTrie
-      }
+  pure HCE.PackageInfo
+        { id = currentPackageId
+        , moduleMap = moduleMap
+        , moduleNameMap = modNameMapResult
+        , directoryTree = directoryTree
+        , externalIdOccMap = references
+        , externalIdInfoMap = topLevelIdentifiersTrie
+        }
   where
-    chEntrypointsToModules :: ChEntrypoint -> (Maybe String, [String])
-    chEntrypointsToModules (ChLibEntrypoint modules otherModules signatures) =
-      ( Nothing
-      , L.map chModuleToString modules ++
-        L.map chModuleToString otherModules ++ L.map chModuleToString signatures)
-    chEntrypointsToModules (ChExeEntrypoint mainModule _otherModules) =
-      (Just mainModule, [])
-    chEntrypointsToModules ChSetupEntrypoint = (Nothing, [])
-    chModuleToString :: ChModuleName -> String
-    chModuleToString (ChModuleName n) = n
-    chComponentNameToComponentType :: ChComponentName -> HCE.ComponentType
-    chComponentNameToComponentType ChSetupHsName = HCE.Setup
-    chComponentNameToComponentType ChLibName = HCE.Lib
-    chComponentNameToComponentType (ChSubLibName name) =
-      HCE.SubLib $ T.pack name
-    chComponentNameToComponentType (ChFLibName name) = HCE.FLib $ T.pack name
-    chComponentNameToComponentType (ChExeName name) = HCE.Exe $ T.pack name
-    chComponentNameToComponentType (ChTestName name) = HCE.Test $ T.pack name
-    chComponentNameToComponentType (ChBenchName name) = HCE.Bench $ T.pack name
-    chComponentNameToComponentId :: ChComponentName -> HCE.ComponentId
-    chComponentNameToComponentId ChLibName = HCE.ComponentId "lib"
-    chComponentNameToComponentId (ChSubLibName name) =
-      HCE.ComponentId . T.append "sublib-" . T.pack $ name
-    chComponentNameToComponentId (ChFLibName name) =
-      HCE.ComponentId . T.append "flib-" . T.pack $ name
-    chComponentNameToComponentId (ChExeName name) =
-      HCE.ComponentId . T.append "exe-" . T.pack $ name
-    chComponentNameToComponentId (ChTestName name) =
-      HCE.ComponentId . T.append "test-" . T.pack $ name
-    chComponentNameToComponentId (ChBenchName name) =
-      HCE.ComponentId . T.append "bench-" . T.pack $ name
-    chComponentNameToComponentId ChSetupHsName = HCE.ComponentId "setup"
+    ghcOptionsForBI :: FilePath -> FilePath -> BuildInfo -> [String] -> [String]
+    ghcOptionsForBI pkgDir distDir bi hiddenLibDirs =
+         hcOptions GHC bi
+      ++ langOpts
+      ++ extOpts
+      ++ includeOpts
+      ++ srcDirOpts
+      where
+        langOpts =
+          maybe [] (\l -> ["-X" <> Distribution.Pretty.prettyShow l]) (defaultLanguage bi)
+        extOpts =
+          let exts = map Distribution.Pretty.prettyShow (defaultExtensions bi ++ otherExtensions bi)
+          in map ("-X" <>) exts
+        includeOpts =
+          concat
+            [ concatMap (\d -> ["-I" <> absJoin d]) (includeDirs bi)
+            , cppOptions bi
+            ]
+        srcDirOpts =
+          concatMap (\d -> ["-i" <> absJoin d]) (collectHsDirs distDir bi hiddenLibDirs)
+        absJoin d =
+          if isAbsolute d then d else normalise (pkgDir </> d)
 
+    collectHsDirs :: FilePath -> BuildInfo -> [FilePath] -> [FilePath]
+    collectHsDirs distDir bi hiddenLibDirs =
+      let sourceDirs = getSymbolicPath <$> hsSourceDirs bi
+          autogenDir = distDir <> "build/autogen"
+          subLibDirs = hiddenLibDirs
+       in sourceDirs <> [ autogenDir ] <> subLibDirs
 
+findSingleCabalFile :: FilePath -> IO FilePath
+findSingleCabalFile dir = do
+  xs <- filter (\p -> takeExtension p == ".cabal") <$> getDirectoryContents dir
+  case xs of
+    [x] -> pure (dir </> x)
+    []  -> ioError (userError ("No .cabal file found in " <> dir))
+    _   -> ioError (userError ("Multiple .cabal files in " <> dir))
 
-#if MIN_VERSION_GLASGOW_HASKELL(8,6,5,0)
 ghcVersion :: Version
-ghcVersion = makeVersion [8, 6, 5, 0]
-#elif MIN_VERSION_GLASGOW_HASKELL(8,6,4,0)
-ghcVersion :: Version
-ghcVersion = makeVersion [8, 6, 4, 0]
-#elif MIN_VERSION_GLASGOW_HASKELL(8,6,3,0)
-ghcVersion :: Version
-ghcVersion = makeVersion [8, 6, 3, 0]
-#elif MIN_VERSION_GLASGOW_HASKELL(8,4,4,0)
-ghcVersion :: Version
-ghcVersion = makeVersion [8, 4, 4, 0]
-#elif MIN_VERSION_GLASGOW_HASKELL(8,4,3,0)
-ghcVersion :: Version
-ghcVersion = makeVersion [8, 4, 3, 0]
-#elif MIN_VERSION_GLASGOW_HASKELL(8,2,2,0)
-ghcVersion :: Version
-ghcVersion = makeVersion [8, 2, 2, 0]
-#else
-ghcVersion :: Version
-ghcVersion = makeVersion [8, 0, 2, 0]
-#endif
+ghcVersion = makeVersion [9, 10, 2, 0]
 
 buildDirectoryTree :: FilePath -> [FilePath] -> (FilePath -> Bool) -> IO HCE.DirTree
 buildDirectoryTree path ignoreDirectories isHaskellModule = do
@@ -331,9 +442,12 @@ buildDirectoryTree path ignoreDirectories isHaskellModule = do
       case splitPath p of
         _x:xs -> joinPath xs
         [] -> ""
+    filterHaskellModule :: HCE.DirTree -> Bool
+    filterHaskellModule (HCE.File _ _ False) = False
+    filterHaskellModule _ = True
     toDirTree :: DT.DirTree FilePath -> HCE.DirTree
     toDirTree (DT.Dir name contents) =
-      HCE.Dir name (map toDirTree . filter (not . DT.failed) $ contents)
+      HCE.Dir name (filter filterHaskellModule $ map toDirTree . filter (not . DT.failed) $ contents)
     toDirTree (DT.File name filePath) =
       HCE.File name filePath (isHaskellModule filePath)
     toDirTree (DT.Failed name err) =
@@ -364,7 +478,7 @@ addReferencesFromModule references modInfo@HCE.ModuleInfo {..} =
              maybe
                Nothing
                (`HM.lookup` idInfoMap)
-               (HCE.internalId (occ :: HCE.IdentifierOccurrence))
+               occ.internalId
            idSrcSpan =
              HCE.IdentifierSrcSpan
                { modulePath = id
@@ -445,16 +559,6 @@ eachIdentifierOccurrence accumulator HCE.ModuleInfo {..} f =
     accumulator
     idOccMap
 
-instance ExceptionMonad (LoggingT IO) where
-  gcatch act h =
-    LoggingT $ \logFn ->
-      runLoggingT act logFn `gcatch` \e -> runLoggingT (h e) logFn
-  gmask f =
-    LoggingT $ \logFn ->
-      gmask $ \io_restore ->
-        let g_restore (LoggingT m) = LoggingT $ \lf -> io_restore (m lf)
-         in runLoggingT (f g_restore) logFn
-
 instance MonadLoggerIO (GhcT (LoggingT IO)) where
   askLoggerIO = GhcT $ const askLoggerIO
 
@@ -465,13 +569,12 @@ instance MonadLogger (GhcT (LoggingT IO)) where
 gtrySync :: (ExceptionMonad m) => m a -> m (Either SomeException a)
 gtrySync action = ghandleSync (return . Left) (fmap Right action)
 
-ghandleSync :: (ExceptionMonad m) => (SomeException -> m a) -> m a -> m a
-ghandleSync onError =
-  ghandle
-    (\ex ->
-       case fromException ex of
-         Just (asyncEx :: SomeAsyncException) -> throw asyncEx
-         _ -> onError ex)
+ghandleSync :: ExceptionMonad m => (SomeException -> m a) -> m a -> m a
+ghandleSync onError action =
+  catch action $ \ex ->
+    case fromException ex of
+      Just (asyncEx :: SomeAsyncException) -> throwM asyncEx
+      _                                    -> onError ex
 
 indexBuildComponent ::
      HCE.SourceCodePreprocessing -- ^ Before or after preprocessor
@@ -493,11 +596,14 @@ indexBuildComponent sourceCodePreprocessing currentPackageId componentId deps@(f
             , T.pack . show $ ex
             ]
         return ([], deps)
+  logDebugN $ T.pack $ "------------------------------------------------------------------------"
+  logDebugN $ T.pack $ "indexBuildComponent"
   ghandleSync onError $
     runGhcT (Just libdir) $ do
-      logDebugN (T.append "Component id : " $ HCE.getComponentId componentId)
-      logDebugN (T.append "Modules : " $ T.pack $ show modules)
-      logDebugN
+      logDebugN $ (T.append "Component id : " $ HCE.getComponentId componentId)
+      logDebugN $ (T.append "Modules : " $ T.pack $ show modules)
+      logDebugN $ (T.append "srcDirs : " $ T.pack $ show srcDirs)
+      logDebugN $
         (T.append "GHC command line options : " $
          T.pack $ L.unwords (options ++ modules))
       flags <- getSessionDynFlags
@@ -505,49 +611,48 @@ indexBuildComponent sourceCodePreprocessing currentPackageId componentId deps@(f
         parseDynamicFlagsCmdLine
           flags
           (L.map noLoc . L.filter ("-Werror" /=) $ options) -- -Werror flag makes warnings fatal
-      (flags'', _) <- liftIO $ initPackages flags'
       logFn <- askLoggerIO
-      let logAction ::
-               DynFlags
-            -> WarnReason
-            -> Severity
-            -> SrcSpan
-            -> Outputable.PprStyle
-            -> SDoc
-            -> IO ()
-          logAction fs _reason _severity srcSpan _stype msg =
+      let logAction :: LogFlags -> MessageClass -> SrcSpan -> SDoc -> IO ()
+          logAction _ msgClass srcSpan msg =
             runLoggingT
-              (logDebugN
-                 (T.append "GHC message : " $
-                  T.pack $
-                  showSDocForUser fs neverQualify msg ++
-                  " , SrcSpan : " ++ show srcSpan))
+              (logDebugN $
+                T.append "GHC message : " $
+                T.pack $
+                  showSDocUnsafe msg ++
+                  " , MessageClass: " ++
+                  " , SrcSpan : " ++ show srcSpan)
               logFn
           mbTmpDir =
-            case hiDir flags'' of
+            case hiDir flags' of
               Just buildDir ->
                 Just $ buildDir </> (takeBaseName buildDir ++ "-tmp")
               Nothing -> Nothing
-      _ <-
-        setSessionDynFlags $
-        L.foldl'
-          gopt_set
-          (flags''
-             { hscTarget = HscAsm
-             , ghcLink = LinkInMemory
-             , ghcMode = CompManager
-             , log_action = logAction
-             , importPaths = importPaths flags'' ++ maybeToList mbTmpDir
-             })
-          [Opt_Haddock]
-      targets <- mapM (`guessTarget` Nothing) modules
+          baseFlags = (flags'
+            { ghcLink = LinkInMemory
+            , ghcMode = CompManager
+            , importPaths = importPaths flags' ++ maybeToList mbTmpDir
+            , packageFlags = [ExposePackage "-package ghc"
+                (PackageArg "ghc")
+                (ModRenaming True [])]
+            })
+          optFlags = L.foldl' gopt_set baseFlags [Opt_Haddock, Opt_ExternalInterpreter]
+          noWarnFlags = L.foldl' wopt_unset optFlags [minBound .. maxBound :: WarningFlag]
+      _ <- setSessionDynFlags noWarnFlags
+      targets <- mapM (\m -> guessTarget m (Nothing :: Maybe UnitId) (Nothing :: Maybe Phase)) modules
+      logDebugN $ T.pack $ "setTarget : " <> (showSDocUnsafe $ ppr targets)
       setTargets targets
+      logDebugN "load LoadAllTargets"
       _ <- load LoadAllTargets
+      logDebugN "getModuleGraph"
       modGraph <- getModuleGraph
-      let topSortMods = flattenSCCs (topSortModuleGraph False modGraph Nothing)
+      let topSortNodes = flattenSCCs (topSortModuleGraph False modGraph Nothing)
+          toModSummary :: ModuleGraphNode -> Maybe ModSummary
+          toModSummary (ModuleNode _ ms) = Just ms
+          toModSummary _               = Nothing
+          topSortMods = mapMaybe toModSummary topSortNodes
           buildDir =
             addTrailingPathSeparator . normalise . fromMaybe "" . hiDir $
-            flags''
+            flags'
           pathsModuleName =
             "Paths_" ++
             map
@@ -555,7 +660,7 @@ indexBuildComponent sourceCodePreprocessing currentPackageId componentId deps@(f
                  if c == '-'
                    then '_'
                    else c)
-              (T.unpack (HCE.name (currentPackageId :: HCE.PackageId)))
+              (T.unpack currentPackageId.name)
       (modSumWithPath, modulesNotFound) <-
         (\(mods, notFound) ->
            ( L.reverse .
@@ -583,7 +688,7 @@ indexBuildComponent sourceCodePreprocessing currentPackageId componentId deps@(f
         logErrorN $
         T.append
           "Cannot find module path : "
-          (toText flags'' $ map ms_mod modulesNotFound)
+          (toText (map ms_mod modulesNotFound))
       foldM
         (\(indexedModules, (fileMap', defSiteMap', modNameMap')) (modulePath, modSum) -> do
            result <-
@@ -591,7 +696,7 @@ indexBuildComponent sourceCodePreprocessing currentPackageId componentId deps@(f
                sourceCodePreprocessing
                componentId
                currentPackageId
-               flags''
+               flags'
                (fileMap', defSiteMap', modNameMap')
                (modulePath, modSum)
            case result of
@@ -613,9 +718,9 @@ indexBuildComponent sourceCodePreprocessing currentPackageId componentId deps@(f
 
 findHaskellModulePath ::
      FilePath -> [FilePath] -> ModSummary -> IO (Maybe HCE.HaskellModulePath)
-findHaskellModulePath buildDir srcDirs modSum =
+findHaskellModulePath buildDir srcDirs modSum = do
   case normalise <$> (ml_hs_file . ms_location $ modSum) of
-    Just modulePath ->
+    Just modulePath -> do
       let toHaskellModulePath = return . Just . HCE.HaskellModulePath . T.pack
           removeTmpDir path =
             case splitDirectories path of
@@ -645,9 +750,15 @@ findHaskellModulePath buildDir srcDirs modSum =
                 case mbFoundPath of
                   Just p -> toHaskellModulePath p
                   _ -> return Nothing
-              | otherwise -> return Nothing
-            Nothing -> toHaskellModulePath modulePath
-    Nothing -> return Nothing
+              | otherwise -> do
+                return Nothing
+            Nothing -> do
+              absBuildDir <- makeAbsolute buildDir
+              let relativePath = makeRelative absBuildDir modulePath
+              toHaskellModulePath relativePath
+    Nothing -> do
+      return Nothing
+    
 
 indexModule ::
      HCE.SourceCodePreprocessing
@@ -660,11 +771,11 @@ indexModule ::
                                               , ModuleDependencies))
 indexModule sourceCodePreprocessing componentId currentPackageId flags deps (modulePath, modSum) =
   gtrySync $ do
-    logDebugN (T.append "Indexing " $ HCE.getHaskellModulePath modulePath)
+    logInfoN (T.append "Indexing " $ HCE.getHaskellModulePath modulePath)
     parsedModule <- parseModule modSum
-    typecheckedModule <- typecheckModule parsedModule
+    typecheckedModule <- typecheckModule parsedModule -- If module has import error. here will throw exception
     hscEnv <- getSession
-    externalPackageState <- liftIO . readIORef . hsc_EPS $ hscEnv
+    externalPackageState <- liftIO (hscEPS hscEnv)
     originalSourceCode <-
       liftIO $
       T.replace "\t" "        " . TE.decodeUtf8 <$>
@@ -681,6 +792,7 @@ indexModule sourceCodePreprocessing componentId currentPackageId flags deps (mod
             currentPackageId
             componentId
             (originalSourceCode, sourceCodePreprocessing)
+            hscEnv
     unless (null typeErrors) $
       logInfoN $ T.append "Type errors : " $ T.pack $ show typeErrors
     deepseq modInfo $ return (modInfo, (fileMap', exportMap', moduleNameMap'))
